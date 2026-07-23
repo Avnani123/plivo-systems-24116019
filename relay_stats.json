@@ -3,6 +3,6 @@
  "down_bytes": 0,
  "up_pkts": 2250,
  "down_pkts": 0,
- "dropped": 52,
- "duplicated": 14
+ "dropped": 123,
+ "duplicated": 25
 }

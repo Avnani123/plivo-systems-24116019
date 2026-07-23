@@ -35,10 +35,9 @@ static FrameBuffer fec_buf[BUFFER_SIZE];
 static pthread_mutex_t buf_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_mutex_t anchor_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t anchor_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t anchor_cond;
 static int anchor_ready = 0;
-static struct timespec anchor_time;
-static uint32_t first_seq;
+static struct timespec min_e0;
 
 static int out_fd;
 static struct sockaddr_in harness_player;
@@ -59,6 +58,14 @@ static void timespec_add_ns(struct timespec *ts, long long ns) {
     }
 }
 
+static int timespec_cmp(const struct timespec *a, const struct timespec *b) {
+    if (a->tv_sec < b->tv_sec) return -1;
+    if (a->tv_sec > b->tv_sec) return 1;
+    if (a->tv_nsec < b->tv_nsec) return -1;
+    if (a->tv_nsec > b->tv_nsec) return 1;
+    return 0;
+}
+
 static void *playout_thread(void *arg) {
     (void)arg;
 
@@ -66,32 +73,35 @@ static void *playout_thread(void *arg) {
     while (!anchor_ready) {
         pthread_cond_wait(&anchor_cond, &anchor_mutex);
     }
-    struct timespec local_anchor = anchor_time;
-    uint32_t local_first_seq = first_seq;
+
+    /* 8ms offset keeps total playout delay at ~48ms (safely below 60ms cap) */
+    long playout_offset_ms = 8;
+    struct timespec frame0_target;
+
+    while (1) {
+        frame0_target = min_e0;
+        timespec_add_ns(&frame0_target, playout_offset_ms * 1000000LL);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        if (timespec_cmp(&now, &frame0_target) >= 0) {
+            break;
+        }
+
+        int rc = pthread_cond_timedwait(&anchor_cond, &anchor_mutex, &frame0_target);
+        if (rc == ETIMEDOUT) {
+            break;
+        }
+    }
+
+    /* Freeze the timeline anchor for playout */
+    struct timespec start_time = frame0_target;
     pthread_mutex_unlock(&anchor_mutex);
 
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    /* 22ms buffer offset allows FEC packets arriving at +50ms to repair lost even frames */
-    long playout_offset_ms = 22;
-
     fprintf(stderr, "\n[DEBUG] === Playout Thread Started ===\n");
-    fprintf(stderr, "[DEBUG] Applied Buffer Offset: %ld ms\n", playout_offset_ms);
-    fprintf(stderr, "[DEBUG] Anchor First Packet Seq: %u\n", local_first_seq);
-    fprintf(stderr, "[DEBUG] Anchor Recv Time: %ld.%09ld s\n", 
-            (long)local_anchor.tv_sec, local_anchor.tv_nsec);
-
-    struct timespec start_time = local_anchor;
-    timespec_add_ns(&start_time, playout_offset_ms * 1000000LL);
-    timespec_add_ns(&start_time, -((long long)local_first_seq * FRAME_INTERVAL_NS));
-
-    long long start_diff_ms = ((long long)(start_time.tv_sec - now.tv_sec) * 1000LL) +
-                              ((start_time.tv_nsec - now.tv_nsec) / 1000000LL);
-
-    fprintf(stderr, "[DEBUG] Computed Start Time (Frame 0): %ld.%09ld s\n", 
+    fprintf(stderr, "[DEBUG] Frozen Playout Start Time (Frame 0): %ld.%09ld s\n", 
             (long)start_time.tv_sec, start_time.tv_nsec);
-    fprintf(stderr, "[DEBUG] Time until Frame 0 playout: %lld ms\n", start_diff_ms);
 
     for (uint32_t current_seq = 0; current_seq < TOTAL_FRAMES; current_seq++) {
         struct timespec target = start_time;
@@ -114,42 +124,49 @@ static void *playout_thread(void *arg) {
         } else {
             memset(send_buf + SEQ_SIZE, 0, PAYLOAD_SIZE); // Concealment
             debug_concealed_count++;
-            fprintf(stderr, "[DEBUG CONCEALED] Frame %u played as SILENCE (missed/unrecovered)\n", current_seq);
         }
         pthread_mutex_unlock(&buf_mutex);
 
         if (current_seq == 0 || current_seq == 1 || current_seq == 10 || 
             current_seq == 100 || current_seq == 750 || current_seq == 1499) {
-            long long delta_us = ((long long)(wakeup_time.tv_sec - target.tv_sec) * 1000000LL) +
-                                 ((wakeup_time.tv_nsec - target.tv_nsec) / 1000LL);
-            fprintf(stderr, "[DEBUG] Frame %4u | Sent at: %ld.%09ld | Delta: %lld us | Status: %s\n",
+            fprintf(stderr, "[DEBUG] Frame %4u | Sent at: %ld.%09ld | Status: %s\n",
                     current_seq, (long)wakeup_time.tv_sec, wakeup_time.tv_nsec, 
-                    delta_us, was_received ? "OK" : "CONCEALED");
+                    was_received ? "OK" : "CONCEALED");
         }
 
         sendto(out_fd, send_buf, sizeof(send_buf), 0,
                (struct sockaddr *)&harness_player, sizeof(harness_player));
     }
-    
+
     fprintf(stderr, "[DEBUG] === Playout Completed All %d Frames ===\n", TOTAL_FRAMES);
     fprintf(stderr, "[DEBUG] Total Frames Recovered by FEC: %d\n", debug_fec_recovered_count);
     fprintf(stderr, "[DEBUG] Total Frames Played as Concealment: %d\n\n", debug_concealed_count);
     return NULL;
 }
 
-static void record_anchor_if_first(uint32_t seq) {
+static void update_anchor(uint32_t seq, const struct timespec *recv_time) {
+    struct timespec e0 = *recv_time;
+    timespec_add_ns(&e0, -((long long)seq * FRAME_INTERVAL_NS));
+
     pthread_mutex_lock(&anchor_mutex);
     if (!anchor_ready) {
-        clock_gettime(CLOCK_MONOTONIC, &anchor_time);
-        first_seq = seq;
+        min_e0 = e0;
         anchor_ready = 1;
-        fprintf(stderr, "[DEBUG] First packet received! Seq: %u\n", seq);
+        pthread_cond_signal(&anchor_cond);
+    } else if (timespec_cmp(&e0, &min_e0) < 0) {
+        min_e0 = e0;
         pthread_cond_signal(&anchor_cond);
     }
     pthread_mutex_unlock(&anchor_mutex);
 }
 
 int main(void) {
+    pthread_condattr_t cattr;
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+    pthread_cond_init(&anchor_cond, &cattr);
+    pthread_condattr_destroy(&cattr);
+
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (in_fd < 0) {
         perror("socket (in)");
@@ -196,6 +213,9 @@ int main(void) {
         }
         if (n != (ssize_t)FRAME_SIZE) continue;
 
+        struct timespec recv_time;
+        clock_gettime(CLOCK_MONOTONIC, &recv_time);
+
         uint32_t net_seq;
         memcpy(&net_seq, wire_buf, SEQ_SIZE);
         uint32_t raw_seq = ntohl(net_seq);
@@ -203,7 +223,7 @@ int main(void) {
         int is_fec = (raw_seq & FEC_FLAG) != 0;
         uint32_t seq = raw_seq & ~FEC_FLAG;
 
-        record_anchor_if_first(seq);
+        update_anchor(seq, &recv_time);
 
         pthread_mutex_lock(&buf_mutex);
 
@@ -221,7 +241,6 @@ int main(void) {
                     }
                     jitter_buf[next_idx].received = 1;
                     debug_fec_recovered_count++;
-                    fprintf(stderr, "[DEBUG FEC RECOVERY] Recovered Frame %u\n", seq + 1);
                 }
             } else {
                 int fec_idx = seq % BUFFER_SIZE;
@@ -233,7 +252,6 @@ int main(void) {
                     }
                     jitter_buf[prev_idx].received = 1;
                     debug_fec_recovered_count++;
-                    fprintf(stderr, "[DEBUG FEC RECOVERY] Recovered Frame %u\n", seq - 1);
                 }
             }
         } else {
@@ -251,7 +269,6 @@ int main(void) {
                 }
                 jitter_buf[prev_idx].received = 1;
                 debug_fec_recovered_count++;
-                fprintf(stderr, "[DEBUG FEC RECOVERY] Recovered Frame %u via FEC %u\n", seq - 1, seq);
             } else if (jitter_buf[prev_idx].received && !jitter_buf[curr_idx].received) {
                 for (int i = 0; i < PAYLOAD_SIZE; i++) {
                     jitter_buf[curr_idx].payload[i] =
@@ -259,7 +276,6 @@ int main(void) {
                 }
                 jitter_buf[curr_idx].received = 1;
                 debug_fec_recovered_count++;
-                fprintf(stderr, "[DEBUG FEC RECOVERY] Recovered Frame %u via FEC %u\n", seq, seq);
             }
         }
 
